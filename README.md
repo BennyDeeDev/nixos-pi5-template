@@ -29,15 +29,6 @@ nixpkgs' generic aarch64 SD image module.
 - An `aarch64-linux` builder, either native, remote, or emulated.
 - A microSD card and Ethernet connection for the Pi.
 
-On an x86_64 NixOS build machine, enable ARM emulation and rebuild:
-
-```nix
-boot.binfmt.emulatedSystems = [ "aarch64-linux" ];
-```
-
-Emulation runs ARM binaries on the build machine; this is not cross-compilation.
-The flashing commands below assume Linux.
-
 ## Bootstrap and deploy
 
 ### 1. Customize the template
@@ -174,22 +165,5 @@ hardware.raspberry-pi.firmware = {
 The activation script requires the partition to be mounted. It rewrites
 `config.txt` and prunes stale device trees and overlays, so keep those changes
 in the Nix configuration rather than editing the FAT files manually.
-
-## Validation
-
-Format Nix files with `nixfmt` and check Markdown with `rumdl`:
-
-```bash
-nixfmt flake.nix hosts/*.nix images/*.nix modules/*.nix
-rumdl check .
-```
-
-Evaluate the outputs without building or activating them:
-
-```bash
-nix eval --raw .#images.pi5-bootstrap.drvPath
-nix eval --raw .#nixosConfigurations.pi5-host-1.config.system.build.toplevel.drvPath
-nix eval --raw .#nixosConfigurations.pi5-host-2.config.system.build.toplevel.drvPath
-```
 
 [pi5-wiki]: https://wiki.nixos.org/wiki/NixOS_on_ARM/Raspberry_Pi_5
