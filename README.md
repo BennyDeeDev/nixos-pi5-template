@@ -1,96 +1,163 @@
 # NixOS on Raspberry Pi 5
 
-Template for building a custom NixOS SD image for the Raspberry Pi 5, then deploying host configurations remotely via `nixos-rebuild`. Fork it, put your SSH key in `modules/pi5-common.nix`, build the image, flash, SSH in, deploy.
+A template for building a Pi 5 bootstrap SD image and deploying host
+configurations over SSH.
 
-## What this repo gives you
+## Repository layout
 
-- `images.pi5-bootstrap` — a minimal SD image with SSH access. Flash once, boot, SSH in. No keyboard or HDMI needed after first flash.
-- `nixosConfigurations.pi5-host-1` and `nixosConfigurations.pi5-host-2` — example host configs. Rename and extend.
-- `modules/pi5-common.nix` — shared base config (SSH, user, kernel, filesystem, packages).
+```text
+hosts/       Example host configurations
+images/      Bootstrap SD image configuration
+modules/     Shared Pi user, SSH, kernel, and filesystem settings
+```
+
+## Outputs
+
+| Output | Purpose |
+| --- | --- |
+| `images.pi5-bootstrap` | SD image with SSH access and hostname `pi5-bootstrap` |
+| `nixosConfigurations.pi5-host-1` | First example host |
+| `nixosConfigurations.pi5-host-2` | Second example host |
+
+Both hosts use [`modules/pi5-common.nix`](modules/pi5-common.nix) and the
+`nixos-hardware` Pi 5 module. The bootstrap image uses the shared module and
+nixpkgs' generic aarch64 SD image module.
 
 ## Prerequisites
 
-### Build box
+- Nix with the `nix-command` and `flakes` experimental features enabled.
+- An `aarch64-linux` builder, either native, remote, or emulated.
+- A microSD card and Ethernet connection for the Pi.
 
-You need a NixOS machine (x86_64 is fine) with aarch64 emulation registered:
+On an x86_64 NixOS build machine, enable ARM emulation and rebuild:
 
 ```nix
 boot.binfmt.emulatedSystems = [ "aarch64-linux" ];
 ```
 
-Rebuild the build box after adding this line.
+Emulation runs ARM binaries on the build machine; this is not cross-compilation.
+The flashing commands below assume Linux.
 
-### nixpkgs channel
+## Bootstrap and deploy
 
-**Pi 5 requires `nixos-unstable`, not `nixos-26.05` (stable).** The stable branch lacks Pi 5-family boot files in its SD image module. The generic aarch64 unstable image has supported Pi 5 since [nixpkgs PR #537862](https://github.com/NixOS/nixpkgs/pull/537862) landed.
+### 1. Customize the template
 
-## Build the bootstrap image
+Fork or copy the repository, then edit
+[`modules/pi5-common.nix`](modules/pi5-common.nix):
+
+- Replace the placeholder SSH public key with your own.
+- Replace `myuser` in both `users.users` and `nix.settings.trusted-users` if
+  using a different username.
+- Set the timezone, locale, and keyboard layout.
+
+Add services to the files under `hosts/`. If renaming a host, update its
+hostname, filename, and corresponding output in `flake.nix`.
+
+Run the remaining build and deployment commands from your checkout root.
+The examples use `myuser` and `pi5-host-1`; substitute your configured names.
+
+### 2. Build the image
 
 ```bash
 nix build .#images.pi5-bootstrap
-zstd -d result/sd-image/*.img.zst -o pi5-bootstrap.img
-sudo dd if=pi5-bootstrap.img of=/dev/sdX bs=4M status=progress conv=fsync
+nix run nixpkgs#zstd -- -d result/sd-image/*.img.zst -o pi5-bootstrap.img
 ```
 
-Uses the mainline Linux kernel — cached on `cache.nixos.org`, fast build. No `nixos-hardware` needed for the bootstrap image because the generic unstable aarch64 SD image already ships Pi 5 device trees, a unified U-Boot binary, and the `[pi5] config.txt` section.
+The flake tracks `nixos-unstable`. Its locked SD image module includes the
+Pi 5 device trees, U-Boot, and firmware configuration needed for this image.
 
-Flash to microSD, not a USB SSD or NVMe. U-Boot on the Pi 5 can't read the boot files back from USB or NVMe yet — only the SD card slot works. Reference: [NixOS Wiki — Pi 5 Storage](https://wiki.nixos.org/wiki/NixOS_on_ARM/Raspberry_Pi_5).
+### 3. Flash the card
 
-## First boot
+Use `lsblk` to identify the microSD card. Replace `/dev/sdX` with its device
+path; the command overwrites that device:
 
 ```bash
-ssh myuser@<pi-ip>
+sudo dd \
+  if=pi5-bootstrap.img \
+  of=/dev/sdX \
+  bs=4M \
+  status=progress \
+  conv=fsync
+sync
 ```
 
-Find the IP via your router's DHCP lease table. If you reflash and see a `REMOTE HOST IDENTIFICATION HAS CHANGED` warning:
+This guide boots from microSD. USB or NVMe storage needs its own boot and
+filesystem setup; see the [Pi 5 storage notes][pi5-wiki].
+
+### 4. Boot and connect
+
+Insert the card, connect Ethernet, and power on the Pi. Find its address in
+your router's DHCP leases. On the deployment machine, replace the example
+address below with the Pi's address:
 
 ```bash
-ssh-keygen -R <pi-ip>
+pi=192.0.2.10
+ssh "myuser@$pi"
 ```
 
-Your SSH key is the only way in (password auth disabled, root login disabled).
+SSH accepts your configured key only; password authentication and root login
+are disabled. `myuser` has passwordless sudo in both the bootstrap image and
+the example hosts.
 
-## Deploy a host config
+After an intentional reflash, remove an obsolete SSH host key if the client
+reports that the host identity changed:
 
 ```bash
-nixos-rebuild switch --flake .#pi5-host-1 --target-host myuser@<pi-ip> --sudo
+ssh-keygen -R "$pi"
 ```
 
-After the first `nixos-rebuild switch`, the Pi runs your host config. All future changes go through `nixos-rebuild switch` over SSH. Reboot once to apply the new hostname.
+### 5. Deploy a host
 
-`pi5-common.nix` sets `security.sudo.wheelNeedsPassword = false` for bootstrap convenience. After your Pi is stable, set up agenix or sops-nix for secret management.
+From the checkout on the deployment machine, using the same `pi` variable:
 
-## Why mainline kernel, not the nixos-hardware vendor kernel
+```bash
+nix run nixpkgs#nixos-rebuild -- switch \
+  --flake .#pi5-host-1 \
+  --target-host "myuser@$pi" \
+  --build-host "myuser@$pi" \
+  --sudo
+```
 
-The deployed hosts import `nixos-hardware.nixosModules.raspberry-pi-5` for board-specific boot setup. But the profile also pins Raspberry Pi's downstream `linux-rpi` kernel, which is **not built by Hydra and not on `cache.nixos.org`** — see [nixos-hardware issue #854](https://github.com/NixOS/nixos-hardware/issues/854). Importing the profile as-is triggers a full kernel build from source: hours under emulation, long even on the Pi itself.
+The Pi builds and activates the host configuration. Use `pi5-host-2` for the
+other example. Repeat the command for later changes, updating the address if
+needed. Reboot to test the new kernel and boot configuration:
 
-To avoid that, `modules/pi5-common.nix` overrides the kernel:
+```bash
+ssh "myuser@$pi" sudo reboot
+```
+
+Passwordless sudo is set in the shared module, not just the bootstrap image.
+Configure a user password or secret management before setting
+`security.sudo.wheelNeedsPassword = true`.
+
+## Kernel and board support
+
+The deployed hosts import `nixos-hardware.nixosModules.raspberry-pi-5` for
+extlinux boot configuration, Pi 5 device-tree filtering, and initrd drivers.
+The profile selects the driver names appropriate to the chosen kernel.
+
+The shared module overrides its Raspberry Pi vendor kernel with:
 
 ```nix
 boot.kernelPackages = pkgs.linuxPackages;
 ```
 
-### What you get from nixos-hardware
+This selects nixpkgs' mainline kernel, which can use the binary cache instead
+of building the vendor kernel locally. To use the vendor kernel, remove the
+override; check cache availability before expecting a quick build.
 
-- Pi 5 boot setup (no GRUB; extlinux-based generations and rollback)
-- BCM2712 device-tree filtering (only Pi 5 device trees land in your system)
-- Pi 5 initrd drivers (NVMe, PCIe, RP1 — so your boot drive comes up)
-- The right driver module names for whichever kernel you pick — the profile adapts automatically
+GPIO, display, HAT, and overlay support can differ between the kernels. Test
+the peripherals needed by your host when changing the kernel or updating
+the locked inputs.
 
-### What you don't get
+## Firmware partition updates
 
-- The Raspberry Pi downstream `linux-rpi` kernel and its vendor-specific patches
-- Automatic FAT partition refresh on `nixos-rebuild switch` (opt-in only — see below)
+The image writes the FAT firmware partition once. With the default template,
+rebuilds update the kernel, initrd, and extlinux configuration on the root
+filesystem; they do not refresh U-Boot, GPU firmware, or `config.txt` on FAT.
 
-### Practical consequences
-
-- Mainline boots Pi 5 fine for headless use: network, USB, NVMe root, framebuffer.
-- You may lose vendor-validated edge cases: RP1 GPIO quirks, VC4 KMS graphics paths, HAT overlays, vendor NVMe timing.
-- To switch to the vendor kernel, comment out the override in `modules/pi5-common.nix`. Expect a long uncached build the first time.
-
-### Firmware partition refresh
-
-The bootstrap image's FAT partition (U-Boot, GPU firmware, `config.txt`, device trees) is written once at image build time. `nixos-rebuild switch` does **not** refresh it — only the ext4 partition (kernel, initrd, `extlinux.conf`) updates on each rebuild. For a headless mainline box this is invisible. If a future nixpkgs bumps U-Boot or you need declarative `config.txt`, either reflash the bootstrap or enable the nixos-hardware firmware module. Mount `/boot/firmware` and add:
+To manage that partition during activation, add the following to the deployed
+host configuration:
 
 ```nix
 fileSystems."/boot/firmware" = {
@@ -104,4 +171,25 @@ hardware.raspberry-pi.firmware = {
 };
 ```
 
-This works with either kernel. The activation script prunes stale `*.dtb` files and overlays it didn't copy, so don't keep manual changes on the FAT partition.
+The activation script requires the partition to be mounted. It rewrites
+`config.txt` and prunes stale device trees and overlays, so keep those changes
+in the Nix configuration rather than editing the FAT files manually.
+
+## Validation
+
+Format Nix files with `nixfmt` and check Markdown with `rumdl`:
+
+```bash
+nixfmt flake.nix hosts/*.nix images/*.nix modules/*.nix
+rumdl check .
+```
+
+Evaluate the outputs without building or activating them:
+
+```bash
+nix eval --raw .#images.pi5-bootstrap.drvPath
+nix eval --raw .#nixosConfigurations.pi5-host-1.config.system.build.toplevel.drvPath
+nix eval --raw .#nixosConfigurations.pi5-host-2.config.system.build.toplevel.drvPath
+```
+
+[pi5-wiki]: https://wiki.nixos.org/wiki/NixOS_on_ARM/Raspberry_Pi_5
